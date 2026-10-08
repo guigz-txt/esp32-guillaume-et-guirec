@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>COGIP — Pointage</title>
+<style>
+:root { font-family: Arial, sans-serif; color: #1f2937; background:#f4f6f8; }
+* { box-sizing:border-box; }
+body { margin:0; }
+header { background:#111827; color:white; padding:22px; }
+header h1 { margin:0 0 6px; }
+.container { max-width:1100px; margin:auto; padding:20px; }
+.grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+.card { background:white; border-radius:12px; padding:18px; box-shadow:0 2px 8px #0001; margin-bottom:16px; }
+.stat { font-size:30px; font-weight:bold; }
+form { display:grid; gap:10px; }
+input, button, select { padding:11px; border:1px solid #d1d5db; border-radius:8px; font-size:15px; }
+button { background:#111827; color:white; cursor:pointer; }
+button.danger { background:#b91c1c; }
+table { width:100%; border-collapse:collapse; }
+th, td { padding:10px; border-bottom:1px solid #e5e7eb; text-align:left; }
+.badge { padding:5px 9px; border-radius:999px; font-weight:bold; font-size:12px; }
+.in { background:#dcfce7; color:#166534; }
+.out { background:#fee2e2; color:#991b1b; }
+.message { padding:12px; border-radius:8px; margin:10px 0; display:none; }
+.ok { background:#dcfce7; color:#166534; }
+.err { background:#fee2e2; color:#991b1b; }
+@media(max-width:750px){ .grid{grid-template-columns:1fr;} table{font-size:13px;} }
+</style>
+</head>
+<body>
+<header>
+  <div class="container">
+    <h1>COGIP — Gestion du pointage</h1>
+    <div>Serveur FastAPI · SQLite · ESP32</div>
+  </div>
+</header>
+
+<main class="container">
+  <div id="message" class="message"></div>
+
+  <section class="grid">
+    <div class="card"><div>Employés actifs</div><div id="employeesCount" class="stat">-</div></div>
+    <div class="card"><div>Présents</div><div id="presentCount" class="stat">-</div></div>
+    <div class="card"><div>Total scans</div><div id="scanCount" class="stat">-</div></div>
+  </section>
+
+  <section class="card">
+    <h2>Ajouter un employé</h2>
+    <form id="employeeForm">
+      <input id="name" placeholder="Nom et prénom" required>
+      <input id="badge" placeholder="ID du badge RFID" required>
+      <button type="submit">Ajouter</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Test de pointage</h2>
+    <form id="scanForm">
+      <input id="scanBadge" placeholder="ID du badge" required>
+      <input id="deviceId" value="WEB-TEST" placeholder="Identifiant appareil">
+      <button type="submit">Scanner le badge</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Employés</h2>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Nom</th><th>Badge</th><th>Statut</th><th>Action</th></tr></thead>
+        <tbody id="employees"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Derniers pointages</h2>
+    <div style="overflow:auto">
+      <table>
+        <thead><tr><th>Date</th><th>Nom</th><th>Badge</th><th>Action</th><th>Appareil</th></tr></thead>
+        <tbody id="attendance"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function showMessage(text, error=false) {
+  const el = $("message");
+  el.textContent = text;
+  el.className = "message " + (error ? "err" : "ok");
+  el.style.display = "block";
+  setTimeout(() => el.style.display="none", 5000);
+}
+
+async function api(url, options={}) {
+  const res = await fetch(url, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || "Erreur serveur");
+  return data;
+}
+
+async function refresh() {
+  const [status, employees, logs] = await Promise.all([
+    api("/api/status"),
+    api("/api/employees"),
+    api("/api/attendance?limit=100")
+  ]);
+
+  $("employeesCount").textContent = status.active_employees;
+  $("presentCount").textContent = status.present;
+  $("scanCount").textContent = status.total_scans;
+
+  $("employees").innerHTML = employees.map(e => `
+    <tr>
+      <td>${escapeHtml(e.name)}</td>
+      <td>${escapeHtml(e.badge_id)}</td>
+      <td>${e.active ? "Actif" : "Désactivé"}</td>
+      <td>
+        <button onclick="toggleEmployee(${e.id}, ${e.active ? 'false':'true'})">
+          ${e.active ? "Désactiver" : "Activer"}
+        </button>
+      </td>
+    </tr>`).join("");
+
+  $("attendance").innerHTML = logs.map(a => `
+    <tr>
+      <td>${escapeHtml(a.scanned_at)}</td>
+      <td>${escapeHtml(a.name)}</td>
+      <td>${escapeHtml(a.badge_id)}</td>
+      <td><span class="badge ${a.action === "IN" ? "in":"out"}">${a.action === "IN" ? "ENTRÉE":"SORTIE"}</span></td>
+      <td>${escapeHtml(a.device_id || "-")}</td>
+    </tr>`).join("");
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+  }[c]));
+}
+
+async function toggleEmployee(id, active) {
+  try {
+    await api("/api/employees/" + id, {
+      method:"PATCH",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({active})
+    });
+    await refresh();
+  } catch(e) { showMessage(e.message, true); }
+}
+
+$("employeeForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    await api("/api/employees", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        name:$("name").value,
+        badge_id:$("badge").value
+      })
+    });
+    e.target.reset();
+    showMessage("Employé ajouté.");
+    await refresh();
+  } catch(e) { showMessage(e.message, true); }
+});
+
+$("scanForm").addEventListener("submit", async e => {
+  e.preventDefault();
+  try {
+    const result = await api("/api/scan", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        badge_id:$("scanBadge").value,
+        device_id:$("deviceId").value
+      })
+    });
+    showMessage(`${result.employee.name} : ${result.message}`);
+    e.target.reset();
+    $("deviceId").value = "WEB-TEST";
+    await refresh();
+  } catch(e) { showMessage(e.message, true); }
+});
+
+refresh().catch(e => showMessage(e.message, true));
+setInterval(() => refresh().catch(()=>{}), 5000);
+</script>
+</body>
+</html>
