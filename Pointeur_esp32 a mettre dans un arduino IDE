@@ -1,0 +1,415 @@
+
+// ============================================================
+// Pointeuse COGIP 2.0
+// ESP32 + RC522 (VSPI) -> API FastAPI
+// Version DEBUG - compatible avec le serveur COGIP
+// ============================================================
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// ------------------------------------------------------------
+// RC522
+// ------------------------------------------------------------
+#define SS_PIN  5
+#define RST_PIN 4
+#define LED_PIN 2
+
+// VSPI ESP32 :
+// SCK  = GPIO 18
+// MISO = GPIO 19
+// MOSI = GPIO 23
+// SS   = GPIO 5
+// RST  = GPIO 4
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ------------------------------------------------------------
+// Wi-Fi
+// ------------------------------------------------------------
+const char* WIFI_SSID = "SFR_F2CF";
+const char* WIFI_PASS = "b43wf8svw9d5u3x4sz4s";
+
+// ------------------------------------------------------------
+// Serveur COGIP
+// ------------------------------------------------------------
+// IP du PC qui fait tourner run_server.py
+const char* API_URL = "http://192.168.1.159:8000/api/scan";
+
+// Identifiant de cette pointeuse
+const char* DEVICE_ID = "ESP32-01";
+
+// ------------------------------------------------------------
+// Variables DEBUG
+// ------------------------------------------------------------
+unsigned long ledOffAt = 0;
+unsigned long lastAlive = 0;
+
+// Évite plusieurs scans du même badge
+String lastBadge = "";
+unsigned long lastScan = 0;
+
+const unsigned long SCAN_COOLDOWN = 3000;
+
+
+// ============================================================
+// Convertit le NUID du RC522 en texte
+// Exemple : A1B2C3D4
+// ============================================================
+String nuidToString()
+{
+  String s = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++)
+  {
+    if (rfid.uid.uidByte[i] < 0x10)
+    {
+      s += "0";
+    }
+
+    s += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  s.toUpperCase();
+
+  return s;
+}
+
+
+// ============================================================
+// Connexion Wi-Fi
+// ============================================================
+void connectWifi()
+{
+  Serial.println();
+  Serial.print("Connexion Wi-Fi a : ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t0 = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - t0 < 15000)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("Wi-Fi OK");
+
+    Serial.print("IP ESP32 : ");
+    Serial.println(WiFi.localIP());
+
+    Serial.print("Passerelle : ");
+    Serial.println(WiFi.gatewayIP());
+
+    Serial.print("Serveur COGIP : ");
+    Serial.println(API_URL);
+  }
+  else
+  {
+    Serial.println("Wi-Fi ECHEC");
+    Serial.println("Verifier SSID / mot de passe.");
+  }
+}
+
+
+// ============================================================
+// Envoie le badge au serveur COGIP
+// ============================================================
+void sendBadgeToServer(String badgeId)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Pas de Wi-Fi.");
+
+    Serial.println("Tentative de reconnexion...");
+    connectWifi();
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("Impossible d'envoyer le badge.");
+    return;
+  }
+
+  HTTPClient http;
+
+  http.setTimeout(5000);
+
+  Serial.println();
+  Serial.println("========== API COGIP ==========");
+  Serial.print("URL : ");
+  Serial.println(API_URL);
+
+  // Connexion HTTP
+  if (!http.begin(API_URL))
+  {
+    Serial.println("ERREUR : impossible d'ouvrir la connexion HTTP.");
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  // ----------------------------------------------------------
+  // IMPORTANT :
+  // Le serveur attend exactement :
+  //
+  // {
+  //   "badge_id": "AABBCCDD",
+  //   "device_id": "ESP32-01"
+  // }
+  // ----------------------------------------------------------
+
+  String body =
+    "{\"badge_id\":\"" +
+    badgeId +
+    "\",\"device_id\":\"" +
+    DEVICE_ID +
+    "\"}";
+
+  Serial.print("POST : ");
+  Serial.println(body);
+
+  int code = http.POST(body);
+
+  Serial.print("Code HTTP : ");
+  Serial.println(code);
+
+  if (code > 0)
+  {
+    String response = http.getString();
+
+    Serial.println("Reponse serveur :");
+    Serial.println(response);
+
+    // --------------------------------------------------------
+    // Interprétation simple de la réponse
+    // --------------------------------------------------------
+
+    if (code == 200)
+    {
+      Serial.println();
+      Serial.println("*** POINTAGE ACCEPTE ***");
+
+      if (response.indexOf("\"action\":\"IN\"") >= 0)
+      {
+        Serial.println(">>> ENTREE");
+      }
+      else if (response.indexOf("\"action\":\"OUT\"") >= 0)
+      {
+        Serial.println(">>> SORTIE");
+      }
+    }
+    else if (code == 404)
+    {
+      Serial.println();
+      Serial.println("*** BADGE INCONNU ***");
+      Serial.println("Ajouter ce badge dans l'interface COGIP.");
+    }
+    else if (code == 409)
+    {
+      Serial.println("*** CONFLIT ***");
+    }
+    else
+    {
+      Serial.println("*** ERREUR SERVEUR ***");
+    }
+  }
+  else
+  {
+    Serial.print("Erreur HTTP : ");
+    Serial.println(http.errorToString(code));
+    Serial.println("Le PC est-il allume ?");
+    Serial.println("Le serveur COGIP est-il lance ?");
+    Serial.println("L'IP 192.168.1.160 est-elle toujours correcte ?");
+  }
+
+  http.end();
+
+  Serial.println("===============================");
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println("     POINTEUSE COGIP - ESP32 + RC522");
+  Serial.println("==========================================");
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // ----------------------------------------------------------
+  // SPI / RC522
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println("Initialisation du RC522...");
+
+  SPI.begin();
+
+  rfid.PCD_Init();
+
+  delay(100);
+
+  byte version = rfid.PCD_ReadRegister(rfid.VersionReg);
+
+  Serial.print("RC522 VersionReg = 0x");
+  Serial.println(version, HEX);
+
+  if (version == 0x00 || version == 0xFF)
+  {
+    Serial.println();
+    Serial.println("!! RC522 NON DETECTE !!");
+    Serial.println();
+    Serial.println("Verifier le cablage :");
+    Serial.println("3.3V  -> 3.3V");
+    Serial.println("GND   -> GND");
+    Serial.println("SDA   -> GPIO 5");
+    Serial.println("SCK   -> GPIO 18");
+    Serial.println("MOSI  -> GPIO 23");
+    Serial.println("MISO  -> GPIO 19");
+    Serial.println("RST   -> GPIO 4");
+  }
+  else
+  {
+    Serial.println("RC522 OK");
+  }
+
+  // ----------------------------------------------------------
+  // Wi-Fi
+  // ----------------------------------------------------------
+
+  connectWifi();
+
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println("Pret : approchez un badge RFID...");
+  Serial.println("==========================================");
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop()
+{
+  // ----------------------------------------------------------
+  // Extinction LED
+  // ----------------------------------------------------------
+
+  if (ledOffAt != 0 && millis() >= ledOffAt)
+  {
+    digitalWrite(LED_PIN, LOW);
+    ledOffAt = 0;
+  }
+
+  // ----------------------------------------------------------
+  // Message de vie toutes les 5 secondes
+  // ----------------------------------------------------------
+
+  if (millis() - lastAlive > 5000)
+  {
+    lastAlive = millis();
+
+    Serial.print("[EN ATTENTE] ");
+
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      Serial.print("Wi-Fi=OK | IP=");
+      Serial.print(WiFi.localIP());
+    }
+    else
+    {
+      Serial.print("Wi-Fi=KO");
+    }
+
+    Serial.println();
+  }
+
+  // ----------------------------------------------------------
+  // Vérification d'un nouveau badge
+  // ----------------------------------------------------------
+
+  if (!rfid.PICC_IsNewCardPresent())
+  {
+    return;
+  }
+
+  Serial.println();
+  Serial.println("Badge detecte...");
+
+  if (!rfid.PICC_ReadCardSerial())
+  {
+    Serial.println("Lecture du NUID impossible.");
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // LED
+  // ----------------------------------------------------------
+
+  digitalWrite(LED_PIN, HIGH);
+  ledOffAt = millis() + 500;
+
+  // ----------------------------------------------------------
+  // Lecture badge
+  // ----------------------------------------------------------
+
+  String badgeId = nuidToString();
+
+  Serial.print("NUID : ");
+  Serial.println(badgeId);
+
+  // ----------------------------------------------------------
+  // Anti-double-scan
+  // ----------------------------------------------------------
+
+  if (badgeId == lastBadge &&
+      millis() - lastScan < SCAN_COOLDOWN)
+  {
+    Serial.println("Scan ignore : badge deja scanne recemment.");
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+
+    delay(300);
+
+    return;
+  }
+
+  lastBadge = badgeId;
+  lastScan = millis();
+
+  // ----------------------------------------------------------
+  // Envoi API
+  // ----------------------------------------------------------
+
+  sendBadgeToServer(badgeId);
+
+  // ----------------------------------------------------------
+  // Fin communication RFID
+  // ----------------------------------------------------------
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  delay(300);
+}
